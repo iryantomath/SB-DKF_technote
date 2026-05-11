@@ -1,1 +1,452 @@
+%%% Code By Iryanto et al. %%%
+%%% Sensitivity-Based Dual Kalman Filter for Actuator Fault Diagnosis -- DC Motor System %%%
+clc; clear; close all;
+%% =========================================================
+% SETTINGS
+%% =========================================================
+dt = 0.005;
+T  = 10;
+N  = round(T/dt);
+t  = (0:N-1)*dt;
 
+MC = 50;   % Monte Carlo runs
+
+%% TRUE PARAMETERS
+% true parameter values
+theta_true = 0.25;
+theta_true_mat = repmat(theta_true,1,N);
+J = 0.01;
+b = 0.1;
+K = 0.01;
+R = 1;
+L = 0.5;
+A = [-b/J   K/J
+    -K/L   -R/L];
+B = [0
+    1/L];
+
+%% NOISE
+sigma_w = 1/100; 
+sigma_v = 95/100; 
+sigma = [sigma_w sigma_v]
+
+%% INPUT (persistent excitation)
+u = 2*cos(1.25*t);
+
+%% MODEL MATRICES
+nx = 2; np = 1;
+Ad = eye(nx) + dt*A;
+Bd = dt*B;
+C  = [1 0];
+Qx = 1e-4*eye(nx);
+R  = 0.01;
+Rt = 0.1; 
+
+%% FORGETTING FACTORS
+lambda_x     = 0.999;
+lambda_theta = 0.99999;
+lambda       = lambda_theta;   % AKF (single)
+
+% ===== trajectory mean =====
+Xtrue_mean = zeros(nx,N);
+
+Xdkf_mean  = zeros(nx,N);
+Xakf_mean  = zeros(nx,N);
+
+Thdkf_mean = zeros(np,N);
+Thakf_mean = zeros(np,N);
+
+% ===== global RMSE =====
+rmse_x_DKF  = zeros(MC,1);
+rmse_x_AKF  = zeros(MC,1);
+
+rmse_th_DKF = zeros(MC,1);
+rmse_th_AKF = zeros(MC,1);
+
+% ===== RMSE each parameter =====
+rmse_theta_DKF_each = zeros(MC,np);
+rmse_theta_AKF_each = zeros(MC,np);
+
+% ===== final parameter =====
+theta_final_DKF = zeros(MC,np);
+theta_final_AKF = zeros(MC,np);
+
+%% =========================================================
+% MONTE CARLO LOOP
+%% =========================================================
+for mc = 1:MC
+    %% TRUE STATE GENERATION (RK4)
+     f = @(x,uk,th) ...
+            A*x ...
+            + B*(1-th)*uk;
+    % Initial value of state
+    x_true = zeros(2,N);
+    x_true(:,1) = [0.5;0];
+    
+    for k=1:N-1
+        k1r = f(x_true(:,k),u(k),theta_true);
+        k2r = f(x_true(:,k)+0.5*dt*k1r,u(k),theta_true);
+        k3r = f(x_true(:,k)+0.5*dt*k2r,u(k),theta_true);
+        k4r = f(x_true(:,k)+dt*k3r,u(k),theta_true);
+        % adding noise model
+        x_det = x_true(:,k) + dt/6*(k1r+2*k2r+2*k3r+k4r);
+        std_x = std(x_det,0,2);
+        x_true(:,k+1) = x_det + sigma_w*std_x.*randn(2,1) ;
+    end
+    %% Measurement (partial)
+    std_x = std(x_true,0,2);
+    y = x_true(1,:) + sigma_v*std_x(1).*randn(1,N); %sigma_v*randn(1,N);
+    %% Initialization of each algorithm
+    % SB - DKF
+    xhat_dkf = [0.;0.];     thetahat_dkf = 0.; 
+    Px = 10*eye(nx);     Pt = 100*eye(np);
+    Gamma = zeros(nx,np);
+    % AKF
+    xhat_akf = xhat_dkf;     thetahat_akf = thetahat_dkf;
+    Px2 = Px;    State = Pt;
+    Upsilon = zeros(nx,np);
+
+    %% =====================================================
+    % STORAGE CURRENT MC
+    %% =====================================================
+    Xdkf  = zeros(nx,N);
+    Xakf  = zeros(nx,N);
+
+    Thdkf = zeros(np,N);
+    Thakf = zeros(np,N);
+
+    %% =====================================================
+    % MAIN LOOP
+    %% =====================================================
+    for k=1:N
+        %% measurement data
+        uk = u(k);
+        yk = y(k);
+
+        %% regressor from measurement Psi
+        Psi = -Bd*uk;
+         %% ======== SB-DKF =========        
+        % Predict state and parameter via (12) - (13)
+        xpred = Ad*xhat_dkf + Bd*u(k) + Psi*thetahat_dkf;
+        thetahat_dkf = thetahat_dkf;
+        % Predict covariance via (14) - (15)
+        Px = (1/lambda_x)*(Ad*Px*Ad') + Qx;
+        Pt = (1/lambda_theta)*Pt;        
+        % Predict the sensitivity matrix via (16)
+        Gamma = Ad*Gamma + Psi;  
+        % Compute innovation (17)
+        innovation = yk - C*xpred;
+        % Compute gains (20)–(21)
+        Sx = C*Px*C' + R;
+        St = C*Gamma*Pt*Gamma'*C' + Rt;
+        Kx = Px*C'*inv(Sx);
+        Kt = Pt*Gamma'*C'*inv(St); 
+        % Update the sensitivity via (22)
+        Gamma = (eye(nx)-Kx*C)*Gamma;
+        % Update the parameter via (23) and the state via (24)
+        xhat_dkf = xpred + (Kx + Gamma*Kt)*innovation;
+        thetahat_dkf = thetahat_dkf + Kt*innovation;
+        % Update the covariances via (25)–(26)
+        Px = (eye(nx)-Kx*C)*Px;
+        Pt = (eye(np)-Kt*C*Gamma)*Pt;
+        %%% =========================================== %%%  
+        
+        %% =========== AKF ===========
+        % Compute the estimation gain via (26) - (34) (Hasan,2024) or via
+        % (5a) - (5d) (5e) - (5i) (Zhang,2018)
+        %%%%%%%%%%%%%%%%%%%%%%%%%%% 
+        Px2 = Ad*Px2*Ad' + Qx;
+        SigmaP = C*Px2*C' + R;
+        Kx2 = Px2*C'*inv(SigmaP);
+        Px2 = (eye(nx)-Kx2*C)*Px2;
+        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%         
+        Omega = C*Ad*Upsilon + C*Psi; %%% switch:: compute Omega first then Gamma since Gamma(k-1)
+        Upsilon = (eye(nx)-Kx2*C)*Ad*Upsilon + (eye(nx)-Kx2*C)*Psi;
+        Lambda = inv(lambda*SigmaP + Omega*State*Omega');
+        Zeta = State*Omega'*Lambda;
+        State = (1/lambda)*State ...
+            - (1/lambda)*State*Omega'*Lambda*Omega*State;
+        % Calculate innovation via (25)
+        ytilde = yk - C*(Ad*xhat_akf + Bd*u(k) + Psi*thetahat_akf);
+        % Estimate state and parameter (23) - (24)
+        theta_old = thetahat_akf;
+        thetahat_akf = thetahat_akf + Zeta*ytilde;
+        xhat_akf = Ad*xhat_akf + Bd*u(k) + Psi*theta_old + Kx2*ytilde + Upsilon*(thetahat_akf-theta_old);        
+        %%% =========================================== %%%
+        
+         %% =================================================
+        % STORE
+        %% =================================================
+        Xdkf(:,k) = xhat_dkf;
+        Xakf(:,k) = xhat_akf;
+
+        Thdkf(:,k) = thetahat_dkf;
+        Thakf(:,k) = thetahat_akf;   
+    end
+    
+    %% =====================================================
+    % MEAN TRAJECTORY
+    %% =====================================================
+    Xtrue_mean = Xtrue_mean + x_true;
+
+    Xdkf_mean = Xdkf_mean + Xdkf;
+    Xakf_mean = Xakf_mean + Xakf;
+
+    Thdkf_mean = Thdkf_mean + Thdkf;
+    Thakf_mean = Thakf_mean + Thakf;
+
+    %% =====================================================
+    % GLOBAL RMSE
+    %% =====================================================
+    % ===== state =====
+    rmse_x_DKF(mc) = sqrt(mean((Xdkf(:)-x_true(:)).^2));
+    rmse_x_AKF(mc) = sqrt(mean((Xakf(:)-x_true(:)).^2));
+
+    % ===== parameter =====
+    rmse_th_DKF(mc) = sqrt(mean((Thdkf(:)-theta_true_mat(:)).^2));
+    rmse_th_AKF(mc) = sqrt(mean((Thakf(:)-theta_true_mat(:)).^2));
+
+    %% =====================================================
+    % RMSE EACH PARAMETER
+    %% =====================================================
+    for p=1:np
+        rmse_theta_DKF_each(mc,p) = sqrt(mean((Thdkf(p,:) - theta_true(p)).^2));
+        rmse_theta_AKF_each(mc,p) = sqrt(mean((Thakf(p,:) - theta_true(p)).^2));
+    end
+
+    %% =====================================================
+    % FINAL PARAMETER
+    %% =====================================================
+    theta_final_DKF(mc,:) = Thdkf(:,end)';
+    theta_final_AKF(mc,:) = Thakf(:,end)';
+    
+end
+
+%% =========================================================
+% AVERAGE
+%% =========================================================
+Xtrue_mean = Xtrue_mean / MC;
+
+Xdkf_mean = Xdkf_mean / MC;
+Xakf_mean = Xakf_mean / MC;
+
+Thdkf_mean = Thdkf_mean / MC;
+Thakf_mean = Thakf_mean / MC;
+
+%% =========================================================
+% FINAL PARAMETER STATISTICS
+%% =========================================================
+mean_DKF = mean(theta_final_DKF);
+std_DKF  = std(theta_final_DKF);
+
+mean_AKF = mean(theta_final_AKF);
+std_AKF  = std(theta_final_AKF);
+
+%% =========================================================
+% DISPLAY
+%% =========================================================
+
+fprintf('\n====================================\n');
+fprintf('GLOBAL RMSE STATE\n');
+fprintf('====================================\n');
+fprintf('SB-DKF : %.4f ± %.4f\n', mean(rmse_x_DKF), std(rmse_x_DKF));
+fprintf('AKF    : %.4f ± %.4f\n', mean(rmse_x_AKF), std(rmse_x_AKF));
+
+fprintf('\n====================================\n');
+fprintf('GLOBAL RMSE PARAMETER\n');
+fprintf('====================================\n');
+fprintf('SB-DKF : %.4f ± %.4f\n', mean(rmse_th_DKF), std(rmse_th_DKF));
+fprintf('AKF    : %.6f ± %.6f\n', mean(rmse_th_AKF), std(rmse_th_AKF));
+
+fprintf('\n====================================\n');
+fprintf('RMSE EACH PARAMETER\n');
+fprintf('====================================\n');
+for p=1:np
+    fprintf('\nTheta_%d\n',p);
+    fprintf('SB-DKF : %.4f ± %.4f\n', mean(rmse_theta_DKF_each(:,p)), std(rmse_theta_DKF_each(:,p)));
+    fprintf('AKF    : %.4f ± %.4f\n', mean(rmse_theta_AKF_each(:,p)), std(rmse_theta_AKF_each(:,p)));
+end
+
+fprintf('\n====================================\n');
+fprintf('FINAL PARAMETER\n');
+fprintf('====================================\n');
+for p=1:np
+    fprintf('\nTheta_%d True = %.4f\n', p, theta_true(p));
+    fprintf('SB-DKF : %.4f ± %.4f\n', mean_DKF(p), std_DKF(p));
+    fprintf('AKF    : %.4f ± %.4f\n', mean_AKF(p), std_AKF(p));
+end
+
+%% =========================================================
+% TIME-VARYING RMSE
+%% =========================================================
+rmse_time_DKF = sqrt(mean((Xdkf_mean - Xtrue_mean).^2,1));
+rmse_time_AKF = sqrt(mean((Xakf_mean - Xtrue_mean).^2,1));
+rmse_time_th_DKF = sqrt(mean((Thdkf_mean - theta_true_mat).^2,1));
+rmse_time_th_AKF = sqrt(mean((Thakf_mean - theta_true_mat).^2,1));
+%% =========================================================
+% PLOTS
+%% =========================================================
+fontName = 'Times New Roman';
+fs_title = 16;
+fs_label = 15;
+fs_tick  = 14;
+fs_legend = 11;
+lw = 3;
+ms = 6;
+
+%% =========================================================
+% FIGURE 1
+% STATE + PARAMETER ESTIMATION
+%% =========================================================
+figure; 
+
+%% =========================================================
+% (a) STATE x1
+%% =========================================================
+subplot(2,2,1)
+hold on
+plot(t,Xtrue_mean(1,:),'k','LineWidth',lw);
+plot(t,Xakf_mean(1,:),'r--','LineWidth',lw);
+plot(t,Xdkf_mean(1,:),'b-.','LineWidth',lw);
+xlabel('Time (s)','FontSize',fs_label)
+ylabel('x_1(t)','FontSize',fs_label)
+title('(a) State Estimation: x_1','FontSize',fs_title)
+legend({'True','AKF','SB-DKF'},'Orientation','horizontal','Location','best','FontSize',fs_legend)
+grid on
+box on
+set(gca,'FontName',fontName,'FontSize',fs_tick,'LineWidth',1.2)
+%% =========================================================
+% (b) STATE x2
+%% =========================================================
+subplot(2,2,2)
+hold on
+plot(t,Xtrue_mean(2,:),'k','LineWidth',lw);
+plot(t,Xakf_mean(2,:),'r--','LineWidth',lw);
+plot(t,Xdkf_mean(2,:),'b-.','LineWidth',lw);
+xlabel('Time (s)','FontSize',fs_label)
+ylabel('x_2(t)','FontSize',fs_label)
+title('(b) State Estimation: x_2','FontSize',fs_title)
+legend({'True','AKF','SB-DKF'},'Orientation','horizontal','Location','best','FontSize',fs_legend)
+grid on
+box on
+set(gca,'FontName',fontName,'FontSize',fs_tick,'LineWidth',1.2)
+
+%% =========================================================
+% (c) PARAMETER theta1
+%% =========================================================
+subplot(2,2,3)
+hold on
+plot(t,theta_true_mat(1,:),'k','LineWidth',lw);
+plot(t,Thakf_mean(1,:),'r--','LineWidth',lw);
+plot(t,Thdkf_mean(1,:),'b-.','LineWidth',lw);
+xlabel('Time (s)','FontSize',fs_label)
+ylabel('\theta_1','FontSize',fs_label)
+title('(c) Parameter Estimation: \theta_1','FontSize',fs_title)
+legend({'True','AKF','SB-DKF'},'Orientation','horizontal','Location','best','FontSize',fs_legend)
+grid on
+box on
+set(gca,'FontName',fontName,'FontSize',fs_tick,'LineWidth',1.2)
+
+%% =========================================================
+% (d) Final Parameter
+%% =========================================================
+subplot(2,2,4)
+hold on
+% true parameter
+plot(1:MC,theta_true*ones(MC,1),'k','LineWidth',lw);
+% AKF
+plot(1:MC,theta_final_AKF,'r--s','LineWidth',lw,'MarkerSize',ms);
+% DKF
+plot(1:MC,theta_final_DKF,'b-o','LineWidth',lw,'MarkerSize',ms);
+xlabel('Monte Carlo Run','FontSize',fs_label)
+ylabel('\theta','FontSize',fs_label)
+title('(d) Final Parameter Estimate: \theta','FontSize',fs_title)
+legend({'True','AKF','SB-DKF'},'Orientation','horizontal','Location','best','FontSize',fs_legend)
+grid on
+box on
+set(gca,'FontName',fontName,'FontSize',fs_tick,'LineWidth',1.2)
+
+%% =========================================================
+% FIGURE 2
+% GLOBAL RMSE + TIME VARYING RMSE
+%% =========================================================
+figure; 
+%% =========================================================
+% (a) GLOBAL RMSE STATE
+%% =========================================================
+subplot(2,2,1)
+hold on
+plot(1:MC,rmse_x_AKF,'r-o','LineWidth',lw,'MarkerSize',ms);
+plot(1:MC,rmse_x_DKF,'b--s','LineWidth',lw,'MarkerSize',ms);
+xlabel('Monte Carlo Run','FontSize',fs_label)
+ylabel('RMSE','FontSize',fs_label)
+title('(a) Global RMSE: State','FontSize',fs_title)
+legend({'AKF','SB-DKF'},'Orientation','horizontal','Location','best','FontSize',fs_legend)
+grid on
+box on
+set(gca,'FontName',fontName,'FontSize',fs_tick,'LineWidth',1.2)
+%% =========================================================
+% (b) GLOBAL RMSE PARAMETER
+%% =========================================================
+subplot(2,2,2)
+hold on
+plot(1:MC,rmse_th_AKF,'r-o','LineWidth',lw,'MarkerSize',ms);
+plot(1:MC,rmse_th_DKF,'b--s','LineWidth',lw,'MarkerSize',ms);
+xlabel('Monte Carlo Run','FontSize',fs_label)
+ylabel('RMSE','FontSize',fs_label)
+title('(b) Global RMSE: Parameter','FontSize',fs_title)
+legend({'AKF','SB-DKF'},'Orientation','horizontal','Location','best','FontSize',fs_legend)
+grid on
+box on
+set(gca,'FontName',fontName,'FontSize',fs_tick,'LineWidth',1.2)
+%% =========================================================
+% (c) TIME-VARYING RMSE STATE
+%% =========================================================
+subplot(2,2,3)
+hold on
+plot(t,rmse_time_AKF,'r','LineWidth',lw);
+plot(t,rmse_time_DKF,'b--','LineWidth',lw);
+xlabel('Time (s)','FontSize',fs_label)
+ylabel('RMSE','FontSize',fs_label)
+title('(c) Time-Varying RMSE: State','FontSize',fs_title)
+legend({'AKF','SB-DKF'},'Orientation','horizontal','Location','best','FontSize',fs_legend)
+grid on
+box on
+set(gca,'FontName',fontName,'FontSize',fs_tick,'LineWidth',1.2)
+%% =========================================================
+% (d) TIME-VARYING RMSE PARAMETER
+%% =========================================================
+subplot(2,2,4)
+hold on
+plot(t,rmse_time_th_AKF,'r','LineWidth',lw);
+plot(t,rmse_time_th_DKF,'b--','LineWidth',lw);
+xlabel('Time (s)','FontSize',fs_label)
+ylabel('RMSE','FontSize',fs_label)
+title('(d) Time-Varying RMSE: Parameter','FontSize',fs_title)
+legend({'AKF','SB-DKF'},'Orientation','horizontal','Location','best','FontSize',fs_legend)
+grid on
+box on
+set(gca,'FontName',fontName,'FontSize',fs_tick,'LineWidth',1.2)
+
+%% GLOBAL RMSE
+fprintf('\n=== SB-DKF & AKF: mean  ===\n');
+% state
+fprintf('%.4f\n', mean(rmse_x_DKF));
+fprintf('%.4f \n', mean(rmse_x_AKF));
+% parameter
+fprintf('%.4f\n', mean(rmse_th_DKF));
+fprintf('%.4f \n', mean(rmse_th_AKF));
+% final parameter
+fprintf('%.4f\n', mean_DKF);
+fprintf('%.4f \n', mean_AKF);
+
+fprintf('\n=== SB-DKF & AKF: std  ===\n');
+% state
+fprintf('%.4f\n', std(rmse_x_DKF));
+fprintf('%.4f \n', std(rmse_x_AKF));
+% parameter
+fprintf('%.4f\n', std(rmse_th_DKF));
+fprintf('%.4f \n', std(rmse_th_AKF));
+% final parameter
+fprintf('%.4f\n', std_DKF);
+fprintf('%.4f \n', std_AKF);
